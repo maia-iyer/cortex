@@ -79,9 +79,13 @@
   The release smoke test installs <em>exactly as a real user would</em>
   (<code>curl | sh</code> from GitHub Releases), so it lands in that number too and
   cannot be filtered out by behaviour. It can be subtracted by <em>count</em>: one
-  job, no matrix, and one install per run lands in these figures — it installs
-  three times, but on a push to main the other two land on <code>main-latest</code>,
-  whose counts reset on every push and are excluded here.
+  install per job that ran the test lands in these figures, passed or failed —
+  each job installs three times, but on a push to main the other two land on
+  <code>main-latest</code>, whose counts reset on every push and are excluded
+  here. The test runs an architecture matrix, so a run is worth as many installs
+  as it had legs that ran;
+  the collector records that per run rather than this page assuming a number, which
+  is what keeps runs from before the matrix counted correctly too.
   <br><br>
   <strong>What it still cannot tell you.</strong> <em>Cortex Installs</em> means
   "not CI" — it <strong>still includes maintainers and contributors</strong>, and at
@@ -97,6 +101,14 @@
 <h2>By release</h2>
 <p class="sub" id="by-release-sub"></p>
 <div id="releases"></div>
+
+<p class="pre">
+  Cortex is an open-source proxy that gives agentic workloads an identity, the right
+  credentials for each call, and a record of what they did.
+  <a href="https://github.com/rossoctl/cortex">Source and install instructions</a>
+  &middot; <a href="https://github.com/rossoctl/cortex/blob/main/CONTRIBUTING.md#install-stats">How
+  these figures are collected</a>
+</p>
 
 <script>
 // ---------------------------------------------------------------------------
@@ -115,23 +127,40 @@
 // count does not have that failure mode.
 const PLATFORMS = ["darwin_arm64", "darwin_amd64", "linux_amd64", "linux_arm64"];
 
-// Installs one successful smoke run adds to the figures THIS PAGE reads.
+// Installs one smoke run adds to the figures THIS PAGE reads.
 //
-// The run installs three times -- a fresh install of the newest stable tag, an
+// Recorded per run by the collector, as how many of its jobs ran the smoke-test
+// step, and read here rather than assumed. The workflow runs an architecture matrix
+// and every leg fresh-installs the current stable release first thing, so a run is
+// worth as many installs as it had legs that ran, passing or not -- and the number
+// changes whenever a leg is added or removed.
+// A constant cannot track that: 1 undercounts every run since the matrix landed,
+// and 2 would overcount every run before it, retroactively, because the figures
+// those runs produced are already in the series.
+//
+// DEFAULT 1 for a run with no `installs` field. That is not a fallback guess: the
+// field postdates the matrix, and a snapshot taken before it was recorded is a
+// snapshot of a workflow that had exactly one job. So 1 is the measured answer for
+// those runs and this page needs no cutoff date to know it.
+//
+// Each job installs three times -- a fresh install of the newest stable tag, an
 // upgrade to the tag under test, and a no-op re-run of it -- so it fetches more
 // than one checksums.txt. But on a main push the tag under test is main-latest,
 // which the collector excludes from .totals because --clobber resets its counts.
-// So exactly one of those fetches lands where this page counts.
+// So exactly one fetch per job lands where this page counts.
 //
-// The live figures settle it: v0.8.1 has 71 checksums fetches against 51
-// successful runs since it published. At 2 per run CI alone would be 102, more
-// than the release has ever been fetched. At 1 per run, 51 CI + 20 people = 71,
-// and the Linux tarballs agree independently (112 / 2 = 56 = 51 + 5).
+// The live figures settled the per-job number, back when a run was one job: v0.8.1
+// had 71 checksums fetches against 51 successful runs since it published. At 2 per
+// run CI alone would have been 102, more than the release had ever been fetched. At
+// 1, 51 CI + 20 people = 71, and the Linux tarballs agreed independently
+// (112 / 2 = 56 = 51 + 5).
 //
-// A TAG-push run does add a little more, on the tag under test, so the people
-// figure can run 1-2 high on a day that cut a tag. That is stated in the footnote
-// rather than modelled.
-const CI_INSTALLS_PER_RUN = 1;
+// A TAG-push run adds more, on the tag under test: every leg after the fresh install
+// lands on that tag, and none of them is subtracted. That is 2 installs per job (the
+// upgrade and the re-install), so the people figure runs high by up to 2 per job on a
+// day that cut a tag. That is stated in the footnote rather than modelled.
+const installsOf = (run) =>
+  typeof run.installs === "number" ? run.installs : 1;
 
 const esc = (s) =>
   String(s).replace(/[&<>"']/g, (c) =>
@@ -162,27 +191,67 @@ function people(installs, ciTests) {
 }
 
 // Every CI run the series has ever seen, merged across snapshots and deduped on
-// id, sorted ascending. The API only returns the last 100 runs (~10 days at the
-// current rate), so reading just the newest snapshot would report 0 for any older
-// interval and subtract nothing from it — silently, as though measured. Merging
-// keeps a run for as long as the series is kept.
+// id, sorted ascending by start time, as {at, installs}. The API only returns the
+// last 100 runs (~10 days at the current rate), so reading just the newest snapshot
+// would report 0 for any older interval and subtract nothing from it — silently, as
+// though measured. Merging keeps a run for as long as the series is kept.
+//
+// The install count travels WITH the run rather than being applied to a total,
+// because it varies per run: the matrix means a run is worth one install per job
+// that ran, and the series spans runs from before the matrix existed. Summing
+// per-run is the only arithmetic that is right for both.
+//
+// LAST SNAPSHOT WINS on a repeated id, which is what lets a run first recorded
+// without an `installs` field be corrected by a later snapshot that has one —
+// snapshots are iterated in date order, so the newer value overwrites.
 //
 // A snapshot whose query failed carries null and contributes nothing, rather than
 // being read as "no runs that day".
 //
+// RUNS THAT INSTALLED NOTHING ARE DROPPED HERE, not by the collector. It records
+// every completed run, zeros included, so that it can recognise a skipped run as
+// one it has already looked at instead of re-querying it daily forever — about a
+// third of the window is skipped runs. They subtract nothing either way, so the
+// only thing this filter changes is the run COUNT the hover text quotes, which
+// should mean "runs that installed" to match the number beside it.
+//
 // Shared by both tables, so it is computed once here rather than per-render.
-function mergeRunTimes(snapshots) {
+function mergeRuns(snapshots) {
   const byId = new Map();
   for (const s of snapshots) {
     if (!Array.isArray(s.smoke_runs)) continue;
     for (const r of s.smoke_runs) {
-      if (r && r.id != null && r.created_at) byId.set(r.id, r.created_at);
+      if (r && r.id != null && r.created_at) {
+        // A run recorded before the collector named platforms was a Linux run: the
+        // macOS smoke test did not exist yet (#956).
+        byId.set(r.id, {
+          at: r.created_at,
+          installs: installsOf(r),
+          platform: r.platform === "darwin" ? "darwin" : "linux",
+        });
+      }
     }
   }
-  return [...byId.values()].sort();
+  return [...byId.values()]
+    .filter((r) => r.installs > 0)
+    .sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
 }
 
-let runTimes = [];
+// Runs and the installs they account for, over a set of runs already filtered to
+// the span in question. Returned together because every caller needs both: the run
+// count is what the hover text explains, and the install count is what gets
+// subtracted.
+const tally = (rs) => ({
+  runs: rs.length,
+  installs: rs.reduce((n, r) => n + r.installs, 0),
+  // Per platform as well, for the releases table, which takes each off its own
+  // column: a macOS run fetches darwin tarballs, a Linux run linux ones. The daily
+  // table needs only the total, since checksums.txt counts installs on every platform.
+  linux: rs.reduce((n, r) => n + (r.platform === "darwin" ? 0 : r.installs), 0),
+  darwin: rs.reduce((n, r) => n + (r.platform === "darwin" ? r.installs : 0), 0),
+});
+
+let runs = [];
 
 function renderDaily(snapshots) {
   const el = document.getElementById("daily");
@@ -199,7 +268,7 @@ function renderDaily(snapshots) {
   // row, because the cron fires at 03:17 UTC and only 6 of 50 runs started before
   // it — an error larger than the ~2.5 installs/day the row reports.
   const runsBetween = (lo, hi) =>
-    runTimes.filter((t) => t > lo && t <= hi).length;
+    tally(runs.filter((r) => r.at > lo && r.at <= hi));
 
   const rows = [];
   let maxPeople = 1;
@@ -219,21 +288,23 @@ function renderDaily(snapshots) {
     // snapshot at or after its end actually carries a run list.
     //
     // That second test is the one that matters: a snapshot whose query failed holds
-    // null, mergeRunTimes skips it, and no earlier snapshot's window reaches forward
+    // null, mergeRuns skips it, and no earlier snapshot's window reaches forward
     // into this interval -- so runsBetween would return 0 and the row would read
     // "no CI" on the strength of a failed request. Checking from i onward is enough
     // because the next successful snapshot's last-100 list covers the gap, which is
     // why this self-repairs the following day.
     const measured = snapshots.slice(i).some((s) => Array.isArray(s.smoke_runs));
     const haveBounds = prevSnap.taken_at && currSnap.taken_at && measured;
-    const ciRuns = haveBounds
+    const span = haveBounds
       ? runsBetween(prevSnap.taken_at, currSnap.taken_at) : null;
+    const ciRuns = span === null ? null : span.runs;
 
-    // One install per run reaches these figures. The run installs three times, but
-    // on a push to main the two extra legs land on main-latest, which the collector
-    // excludes from .totals. See CI_INSTALLS_PER_RUN for the arithmetic that
-    // settles it.
-    const ciInstalls = ciRuns === null ? null : ciRuns * CI_INSTALLS_PER_RUN;
+    // One install per JOB that ran reaches these figures, summed per run rather
+    // than multiplied: an arch matrix makes a run worth more than one, and the
+    // series spans runs from before it. Each job installs three times, but on a
+    // push to main the two extra legs land on main-latest, which the collector
+    // excludes from .totals. See installsOf for the arithmetic that settles it.
+    const ciInstalls = span === null ? null : span.installs;
     const est = ciInstalls === null
       ? { value: null, underflow: false, raw: null }
       : people(installs, ciInstalls);
@@ -261,7 +332,7 @@ function renderDaily(snapshots) {
       <td>${peopleCell}</td>
       <td style="text-align:left">${w ? `<span class="bar" style="width:${w}px"></span>` : ""}</td>
       <td class="ci"${r.ciRuns !== null
-        ? ` title="${r.ciRuns} runs × ${CI_INSTALLS_PER_RUN} install each"` : ""
+        ? ` title="${r.ciRuns} runs, one install per job that ran"` : ""
       }>${r.ciInstalls === null ? "?" : r.ciInstalls}</td>
     </tr>`;
   }).reverse().join("");
@@ -280,11 +351,12 @@ function renderDaily(snapshots) {
     <code>checksums.txt</code>, one per install on every platform — and this column
     is that figure minus the CI installs beside it. Add the two columns back
     together to recover it.
-    <strong>Cortex CI Tests</strong> is one install per successful run of the
-    release smoke test. It installs exactly the way a person does, which is why it
-    has to be subtracted rather than filtered out. On a day that cut a release tag
-    the real figure is 1-2 higher, because the run's upgrade leg lands on that tag
-    instead of on <code>main-latest</code>.
+    <strong>Cortex CI Tests</strong> is one install per job of the release smoke
+    test that ran, passed or failed, with one job per architecture. It installs exactly the
+    way a person does, which is why it has to be subtracted rather than filtered
+    out. On a day that cut a release tag the real figure is higher by up to 2 per job,
+    because a tag-push job's upgrade and re-install legs land on that tag instead of
+    on <code>main-latest</code>, and are not counted here.
     Each row covers the span between two snapshots, and CI runs are counted over
     that same span rather than by calendar date.
     <code>~0</code> marks an interval where CI was counted higher than installs
@@ -293,15 +365,82 @@ function renderDaily(snapshots) {
   </p>`;
 }
 
-// Per-release view: which versions are actually being fetched. Sorted by install
-// count rather than by date, because the question this answers is "what is in
-// use", not "what shipped when".
+// Release tags compare by version, not as strings: v0.10.0 must sort above
+// v0.9.0 and alpha.10 above alpha.9, neither of which a lexical compare gives.
+// (The current-release selection below has the same complaint about tag and
+// date sorts -- which release is "latest" is GitHub's answer, not ours -- but
+// ORDERING rows only needs precedence, which is local and exact.)
 //
-// CI is filled for the CURRENT release only. A run carries head_branch=main and no
-// tag, so what is known is that it installed whichever release was newest at the
-// time -- which is this one, for every run since it was published. Attributing runs
-// to an older release would need the boundary with its successor and a run history
-// reaching that far back, so those rows stay blank rather than truncated.
+// Semver precedence: strip a leading "v", compare the dotted core numerically,
+// then a pre-release suffix (-alpha.3, -rc.2) BELOW the plain version, its
+// identifiers numeric where numeric and lexical otherwise -- so alpha < rc and
+// rc.10 > rc.9. A tag that does not parse sorts below every versioned one --
+// among themselves unparsed tags compare as strings -- so an unexpected
+// name still orders deterministically instead of failing to.
+function compareRelease(a, b) {
+  const parse = (tag) => {
+    // The dash is required to introduce a pre-release, so a malformed tag
+    // (anything the pattern does not match) falls below every versioned tag
+    // rather than being half-parsed into an ordering it does not mean.
+    const m = /^v?(\d+(?:\.\d+)*)(?:-(.+))?$/.exec(tag);
+    return m ? { core: m[1].split(".").map(Number), pre: m[2] && m[2].split(".") } : null;
+  };
+  const pa = parse(a), pb = parse(b);
+  if (!pa || !pb) return pa ? 1 : pb ? -1 : a < b ? -1 : a > b ? 1 : 0;
+  for (let i = 0; i < Math.max(pa.core.length, pb.core.length); i++) {
+    const d = (pa.core[i] || 0) - (pb.core[i] || 0);
+    if (d) return d;
+  }
+  // A pre-release sorts below the plain version: v0.7.0 above v0.7.0-rc.3.
+  if (pa.pre && !pb.pre) return -1;
+  if (!pa.pre && pb.pre) return 1;
+  if (!pa.pre) return 0;
+  for (let i = 0; i < Math.max(pa.pre.length, pb.pre.length); i++) {
+    const x = pa.pre[i], y = pb.pre[i];
+    if (x === y) continue;
+    if (x === undefined) return -1; // shorter pre-release = lower precedence
+    if (y === undefined) return 1;
+    const xn = /^\d+$/.test(x), yn = /^\d+$/.test(y);
+    if (xn && yn) return Number(x) - Number(y);
+    if (xn !== yn) return xn ? -1 : 1; // numeric identifiers sort below words
+    return x < y ? -1 : 1;
+  }
+  return 0;
+}
+
+// Per-release view: which versions are actually being fetched. Sorted by
+// version, highest first, so a release can be found without scanning the whole
+// table.
+//
+// It was sorted by install count before, and that read as scrambled: the sort
+// key was the checksums figure, which this table does not display, so rows
+// ordered by one number appeared shuffled against the two that are shown
+// (alpha.3 above alpha.7 on the strength of a figure the page never prints).
+// Version order costs nothing -- the tags are unique, so there are no ties to
+// break -- and answers "where is v0.7.0" directly.
+//
+// CI is filled for EVERY release the run history covers, not just the current one.
+// A run carries head_branch=main and no tag, so what is known is when it started,
+// and the smoke script's own rule for what its fresh install takes then: the
+// highest-versioned STABLE release (`gh release list --exclude-pre-releases`, then
+// `sort -V | tail -1`). So each stable release owns the runs from its publication
+// until a higher version is published, and both ends are in data.json already, so
+// the attribution is a bucketing of the merged run list rather than a new
+// measurement. The highest version's span is the open-ended one.
+//
+// This replaced a scope that filled the current row alone and left every other row
+// "—". The gap that exposed: the three releases that absorbed essentially all the CI
+// traffic are v0.8.1, v0.9.0 and v0.9.1, and two of them had already stopped being
+// current -- so their Linux columns carried CI with nothing subtracted and no figure
+// beside them saying how much. Lifetime, Mac leads Linux 646 tarballs to 548; those
+// three rows were the whole of the apparent Linux lead, which read as a platform
+// result rather than as the smoke test it is.
+//
+// What is NOT derived here is which release is CURRENT: GitHub's /releases/latest
+// still answers that, as it always did. The smoke test does not consult it -- it
+// passes --ref explicitly, picked by the rule above -- so the two can name
+// different releases, and each is used only for what it decides.
+
 function renderReleases(snapshots) {
   const el = document.getElementById("releases");
   const sub = document.getElementById("by-release-sub");
@@ -312,8 +451,9 @@ function renderReleases(snapshots) {
 
   const latest = snapshots[snapshots.length - 1];
   sub.textContent = `Lifetime installs per release, as of ${latest.date}. `
-    + "CI is subtracted on the current release's row only; every other row is "
-    + "marked unadjusted.";
+    + "Sorted by version, highest first. "
+    + "CI is subtracted from Linux on every release the run history reaches; "
+    + "a row the history cannot cover is marked unadjusted.";
 
   // Releases with no downloads at all are dropped: the asset matrix publishes
   // builds that have never been fetched, and listing dozens of zero rows would
@@ -342,11 +482,12 @@ function renderReleases(snapshots) {
       linux: half(at(r.platforms, "linux_amd64") + at(r.platforms, "linux_arm64")),
       mac: half(at(r.platforms, "darwin_arm64") + at(r.platforms, "darwin_amd64")),
       tarballs: PLATFORMS.reduce((n, p) => n + at(r.platforms, p), 0),
-      // Carried for ordering only -- see the current-release selection below.
+      // Starts a stable release's span as the smoke test's install target, and
+      // ends the span of every lower version. Not used to order rows.
       published_at: r.published_at,
     }))
     .filter((r) => r.installs || r.tarballs)
-    .sort((a, b) => b.installs - a.installs || b.tarballs - a.tarballs);
+    .sort((a, b) => compareRelease(b.tag, a.tag));
 
   if (!rels.length) {
     el.innerHTML = '<p class="empty">No releases with downloads yet.</p>';
@@ -361,76 +502,150 @@ function renderReleases(snapshots) {
   // one the installer follows, so it is the only one that matches reality.
   const current = latest.latest_release || null;
 
-  // CI for the current release, counted over the release's OWN lifetime rather
-  // than over whatever window the API happened to return. A release download count
-  // is lifetime, so the CI figure has to be too, or the two cannot be differenced.
+  // CI per release, counted over each release's OWN lifetime rather than over
+  // whatever window the API happened to return. A release download count is
+  // lifetime, so the CI figure has to be too, or the two cannot be differenced.
   //
-  // Only the current release gets one. A run reports head_branch=main and no tag,
-  // so what is known is that it installed whichever release was newest at the time
-  // -- which is this one, for every run since it was published. For an older
-  // release the same reasoning gives runs between its publication and its
-  // successor's, which the merged run list can answer only as far back as it
-  // reaches; rather than show a figure that silently truncates, those rows stay "—".
-  const currentRel = rels.find((r) => r.tag === current);
-  const ciRuns = (currentRel && currentRel.published_at && runTimes.length)
-    ? runTimes.filter((t) => t >= currentRel.published_at).length
-    : null;
-  const ciInstalls = ciRuns === null ? null : ciRuns * CI_INSTALLS_PER_RUN;
+  // A run's fresh install takes the highest-versioned STABLE release published by
+  // the time the run starts -- the smoke script's `sort -V | tail -1` over
+  // `gh release list --exclude-pre-releases`. So a stable release's span as the
+  // target is [its publication, the first publication of any higher version), and
+  // the spans come from the full release list rather than from `rels`: the script
+  // picks among every release, not only those with downloads.
+  //
+  // Ordering by PUBLICATION TIME instead, as this table once did, credited runs to
+  // whatever published last. Four pre-releases published in a row (v0.9.0-rc.1 to
+  // rc.4) were each charged with runs that all installed v0.8.1 -- 72 of them, so
+  // v0.8.1 read 85 people against a true 13, and the rc rows read ~0 (#1622). A
+  // backport published after a newer minor would be charged the same way.
+  //
+  // Two kinds of release are therefore never a target and get no span at all: a
+  // pre-release, and a stable release published after a higher version already was
+  // (a backport). CI does still land on them, through the upgrade and re-run legs of
+  // their own tag push, but a run carries no tag, so the run history cannot say
+  // which runs those were. That is unknown rather than zero, and renders "—".
+  //
+  // A RUN OLDER THAN EVERY STABLE RELEASE FALLS INTO NO SPAN, and is dropped from
+  // every tally: it installed something this data does not list. So the CI column
+  // sums to the runs the table can place, which is the most it can claim.
+  const stableByVersion = (latest.releases || [])
+    .filter((r) => !r.prerelease && r.published_at)
+    .sort((a, b) => compareRelease(b.tag, a.tag));
 
-  // Is the CI count a floor rather than a total?
+  // tag -> {runs, installs}, one entry per release that has a span.
   //
-  // Only when runs are actually missing. The first snapshot's page holds 100 runs,
-  // so if the workflow has ever had 100 or fewer in total, that page IS its whole
-  // history and nothing is missing -- even though its earliest run postdates a
-  // release published before the workflow existed. Without the total_count test
-  // that case marks a false floor, which is what v0.8.1 was showing.
-  // Read total_count from the same snapshot that supplied the earliest run, not
-  // from whichever snapshot happens to carry one first. A snapshot whose runs
-  // query failed can still have populated total_count, and pairing that count
-  // with a different snapshot's earliest run compares two unrelated moments.
-  const firstWithRuns = snapshots.find((s) => Array.isArray(s.smoke_runs)
-    && s.smoke_runs.length > 0);
-  const everCount = firstWithRuns
-    ? firstWithRuns.smoke_runs_total_count : null;
-  const historyComplete = typeof everCount === "number" && everCount <= 100;
-  // runTimes[0] is the earliest run across ALL snapshots, which is the right
-  // bound: it is the oldest run the page actually knows about, whatever snapshot
-  // reported it. total_count above only decides whether anything is missing at all.
-  const ciPartial = ciRuns !== null && runTimes.length > 0
-    && !historyComplete
-    && currentRel.published_at < runTimes[0];
+  // A span's end is the first publication of any HIGHER version, which the walk
+  // finds by carrying the earliest publication seen so far: stableByVersion runs
+  // highest first, so when a release is reached, `cut` holds the earliest
+  // publication among every version above it.
+  //
+  // A release published at or after `cut` was never the highest version, so it was
+  // never a target and gets no entry: the backport case above. Its own publication
+  // cannot lower `cut` for the versions below it, either, since it is later.
+  //
+  // A span that CLOSED before the run list begins gets no entry, and so renders
+  // "—". Bucketing it would tally 0 runs and the row would read "0 CI" -- or "≥0"
+  // once the floor marker applies -- which is a measurement the page cannot support:
+  // the whole span sits in the blind spot before runs[0], so the honest answer is
+  // unknown rather than a number. "—" already means exactly that here, and it keeps
+  // the floor marker for the one kind of row it informs: a span the list reaches
+  // INTO but not back to the start of.
+  //
+  // NO RUNS AT ALL MEANS NO SPANS. An empty merged list is not a measurement of zero
+  // CI: it is what a failed query leaves behind (the collector writes null, not [],
+  // exactly so the two stay distinguishable), or a series too young to hold one.
+  // Bucketing against it would tally 0 for every release and print a bold, confident
+  // Linux figure with "0" beside it -- the silent zero this page avoids everywhere
+  // else. Leaving the map empty renders every row as unadjusted with "—" instead.
+  const earliestRun = runs.length ? runs[0].at : null;
+  const ciByTag = new Map();
+  if (earliestRun !== null) {
+    let cut = null;
+    for (const r of stableByVersion) {
+      const end = cut;
+      if (cut === null || r.published_at < cut) cut = r.published_at;
+      if (end !== null && r.published_at >= end) continue;
+      if (end !== null && end <= earliestRun) continue;
+      ciByTag.set(r.tag, tally(runs.filter((run) =>
+        run.at >= r.published_at && (end === null || run.at < end))));
+    }
+  }
+
+  // Is a release's CI count a floor rather than a total?
+  //
+  // Only when runs are actually missing from the FRONT of its span. The merged
+  // list holds every run any snapshot ever reported, so what bounds it below is
+  // runs[0] -- the earliest run the page knows about, whatever snapshot reported it.
+  // A release published before that instant has lost runs off the front of its
+  // span and can only state a floor; one published after it has its whole span
+  // covered, because the list reaches back past its start.
+  //
+  // THE total_count TEST THAT USED TO GUARD THIS IS GONE, deliberately. It asked
+  // whether the first snapshot's page of 100 was the workflow's entire history --
+  // `smoke_runs_total_count <= 100` -- and treated that as "nothing is missing
+  // anywhere". The count is a measurement of ONE MOMENT: it read 76 in the first
+  // snapshot here, while the merged list already holds 98 installing runs, because
+  // runs created after that snapshot pushed the true total past 100. So the test
+  // answered "complete" for a history that is not, and suppressed the floor marker
+  // on v0.8.1 -- a release whose span genuinely opens 31 hours before the oldest
+  // run the page has. It printed a bare 8 against a Linux column of 84.
+  //
+  // That staleness was always there; it just could not be seen while only the
+  // current release was adjusted, since the current release is never the one missing
+  // runs off its front. Comparing against runs[0] needs no count and cannot go
+  // stale: it is a fact about the list the page is actually summing. The case the
+  // count existed to protect -- a release predating the workflow itself -- is
+  // reported as a floor now, which is the weaker and true claim ("at least this
+  // many"), rather than a total that happens to be right for a reason the page
+  // cannot verify.
+  const partialFor = (rel) => runs.length > 0
+    && rel.published_at < runs[0].at;
 
   const rows = rels.map((r) => {
     const isCurrent = r.tag === current;
 
+    // Every release with a span gets a CI figure, so a row reads "—" only when
+    // there is genuinely nothing to say: no run list in any snapshot, a release
+    // that was never the smoke test's target (a pre-release or a backport), or one
+    // with no published_at to start a span with.
+    const ci = ciByTag.get(r.tag) || null;
+    const ciRuns = ci === null ? null : ci.runs;
+    // Summed per run, for the reason in installsOf: an arch matrix makes a run worth
+    // one install per job that ran, and this span reaches back across runs from before
+    // the matrix existed, which were worth one apiece.
+    const ciInstalls = ci === null ? null : ci.installs;
+    const ciPartial = ci !== null && partialFor(r);
+
     // Both platform columns are NON-CI, so that "Installs" means one thing across
-    // the whole table. CI comes off Linux alone because the smoke test runs only
-    // on Linux, so the Mac figure needs no adjustment.
+    // the whole table. Each comes off its own column: the Linux smoke test's from
+    // Linux and, since #956, the macOS smoke test's from Mac.
     //
     // Through people(), not a bare Math.max: the clamp alone would render an
     // underflow as a bold, plausible number, which is the failure people() exists
     // to prevent.
-    const linuxEst = isCurrent && ciInstalls !== null
-      ? people(r.linux, ciInstalls) : null;
+    const linuxEst = ci !== null ? people(r.linux, ci.linux) : null;
+    // Not marked as a floor the way Linux can be: the macOS smoke test began long
+    // after the oldest run this page holds, so no span has lost macOS runs off its
+    // front, and a span before it began truly had none.
+    const macEst = ci !== null ? people(r.mac, ci.darwin) : null;
+    // Unadjusted is said, as in the Linux column, now that Mac has CI to subtract.
+    const macCell = macEst === null
+      ? `<span class="delta" title="not adjusted for CI — the run history does not reach a span when the smoke test installed this release, so its CI installs are unknown">${r.mac}</span>`
+      : macEst.underflow
+        ? `<span class="delta" title="${r.mac} Mac installs including CI, against ${ci.darwin} CI, so this would be ${macEst.raw}">~0</span>`
+        : `${macEst.value}`;
 
     // Where no estimate is possible the figure is shown UNADJUSTED and said to be,
-    // rather than printed bare under a footnote claiming CI is excluded.
-    //
-    // This is not only a future concern. It is every row but one today: a tag's own
-    // smoke run upgrades to the tag under test, so rc.1 and rc.3 each carry one CI
-    // install in their Linux count, and rc.2 one of its three. It also catches
-    // v0.8.1 the moment v0.9.0 ships and it stops being current, plus the cases
-    // where latest_release is null or no snapshot carries smoke_runs. What
-    // data.json holds cannot adjust a release that has stopped being current, so
-    // the claim is scoped instead of the number being guessed at.
+    // rather than printed bare under a footnote claiming CI is excluded. Four ways
+    // to land here, all of them "this row has no span": a release old enough that
+    // its whole span predates the run list, one that was never the smoke test's
+    // target, one with no published_at, or no snapshot carrying smoke_runs at all.
+    // One reason covers them, and none of them is about whether the row is current
+    // -- which no longer decides this.
     const linuxCell = linuxEst === null
-      // The reason has to hold for all three ways of landing here, not just the
-      // common one: this release is not current, OR latest_release is null, OR no
-      // snapshot carries smoke_runs. Naming only the first would put "not the
-      // current one" on a row badged `current`.
-      ? `<span class="delta" title="not adjusted for CI — the smoke runs that installed this release cannot be identified">${r.linux}</span>`
+      ? `<span class="delta" title="not adjusted for CI — the run history does not reach a span when the smoke test installed this release, so its CI installs are unknown">${r.linux}</span>`
       : linuxEst.underflow
-        ? `<span class="delta" title="${r.linux} Linux installs including CI, against ${ciInstalls} CI, so this would be ${linuxEst.raw}">~0</span>`
+        ? `<span class="delta" title="${r.linux} Linux installs including CI, against ${ci.linux} CI, so this would be ${linuxEst.raw}">~0</span>`
         // A floor subtracted gives an upper bound, not a figure.
         : ciPartial
           ? `<span class="delta" title="CI for this release is a floor, so this is an upper bound">≤${linuxEst.value}</span>`
@@ -442,11 +657,11 @@ function renderReleases(snapshots) {
           : r.prerelease ? ' <span class="pre">pre-release</span>' : ""
       }</td>
       <td>${linuxCell}</td>
-      <td class="mac">${r.mac}</td>
-      <td class="delta"${isCurrent && ciRuns !== null
-        ? ` title="${ciRuns} runs × ${CI_INSTALLS_PER_RUN} install each, since ${esc(r.published_at.slice(0, 10))}${ciPartial ? " — at least this many; the run history does not reach back to publication" : ""}"`
+      <td class="mac">${macCell}</td>
+      <td class="delta"${ciRuns !== null
+        ? ` title="${ciRuns} runs, one install per job that ran (${ci.linux} Linux, ${ci.darwin} macOS), while ${esc(r.tag)} was the highest stable version${ciPartial ? " — at least this many; the run history does not reach back to publication" : ""}"`
         : ""}>${
-        ciInstalls === null || !isCurrent ? "—"
+        ciInstalls === null ? "—"
           : (ciPartial ? "≥" : "") + ciInstalls
       }</td>
     </tr>`;
@@ -462,18 +677,27 @@ function renderReleases(snapshots) {
   </table>
   <p class="sub" style="margin-top:.7rem">
     <strong>Linux</strong> and <strong>Mac Installs</strong> are lifetime figures.
-    CI is subtracted from Linux <strong>on the current release's row only</strong> —
-    that is the one row whose CI runs can be identified, and the smoke test runs
-    only on Linux, so Mac needs no adjustment. Every other Linux figure is greyed
-    and <strong>unadjusted</strong>: it keeps whatever CI that release received
-    while it was current, plus one install from its own tag's smoke run.
+    CI is subtracted on <strong>every release the run history reaches</strong>,
+    because the smoke tests install the highest stable version when they run — so each
+    stable release owns the runs from its publication until a higher version is
+    published. Each platform loses its own test's installs: the Linux smoke test's come
+    off Linux, and the macOS smoke test's, which began with #956, off Mac. A figure
+    is greyed and <strong>unadjusted</strong> where its CI cannot be counted: no run
+    list in any snapshot, a release with no publication date, or a pre-release or
+    backport, which the smoke test never takes as its fresh install.
+    <strong>Read the Linux column against Mac with the CI column in hand.</strong>
+    Lifetime, Mac is the larger platform here; the releases where Linux leads are the
+    ones that were current while the smoke test was running, and the CI figure beside
+    each is how much of that lead was the test.
     Both columns come from tarball downloads, halved because each install fetches
     two binaries of one platform, so they can disagree with the independent
     <code>checksums.txt</code> count. <code>checksums.txt</code> is the figure to
     trust where they differ.
-    <strong>CI Tests</strong> is one install per successful run of the smoke test,
-    filled for the current release only: a run carries no tag, so what is known is
-    that it installed whichever release was newest at the time.
+    <strong>CI Tests</strong> is one install per job of either smoke test that ran
+    (one job per runner), with the Linux and macOS split in its hover text: a run
+    carries no tag, so what is known is that it
+    installed the highest stable version when it started, which is what assigns it
+    to a release.
     <code>—</code> means unknown, not zero; <code>≥</code> means the run history does
     not reach back to publication, so the CI figure is a floor and the Linux figure
     beside it an upper bound.
@@ -490,7 +714,7 @@ fetch(`data.json?t=${Date.now()}`)
   .then((data) => {
     const snapshots = (data.snapshots || []).slice().sort((a, b) =>
       a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
-    runTimes = mergeRunTimes(snapshots);
+    runs = mergeRuns(snapshots);
     renderDaily(snapshots);
     renderReleases(snapshots);
   })
